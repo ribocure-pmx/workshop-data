@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import {
   ComposedChart,
   Line,
+  Area,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -20,8 +21,16 @@ function emaxModel(dose, E0, Emax, ED50) {
 }
 
 // Add random noise to simulated data
+// Generate standard normal random variable using Box-Muller transform
+function randn() {
+  const u1 = Math.random();
+  const u2 = Math.random();
+  return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
+
+// Add normally distributed noise to a value
 function addNoise(value, noiseLevel = 5) {
-  return value + (Math.random() - 0.5) * 2 * noiseLevel;
+  return value + randn() * noiseLevel;
 }
 
 // Calculate residual sum of squares
@@ -71,34 +80,115 @@ function optimizeParameters(data, initialParams, iterations = 1000, learningRate
   return bestParams;
 }
 
-// Calculate standard errors using bootstrap-like approach
-function calculateStandardErrors(data, params, numSamples = 100) {
+// Calculate variance-covariance matrix and standard errors using Hessian matrix (2nd derivatives)
+// Returns both the standard errors and the full covariance matrix for multivariate uncertainty
+function calculateCovarianceMatrix(data, params) {
   const E0 = 100; // Fixed E0
-  const estimates = { Emax: [], ED50: [] };
-
-  for (let i = 0; i < numSamples; i++) {
-    // Resample data with noise
-    const resampledData = data.map(d => ({
-      x: d.x,
-      y: addNoise(emaxModel(d.x, E0, params.Emax, params.ED50), 3)
-    }));
-
-    const optimized = optimizeParameters(resampledData, params, 200, 0.02);
-    estimates.Emax.push(optimized.Emax);
-    estimates.ED50.push(optimized.ED50);
+  const { Emax, ED50 } = params;
+  
+  // Calculate residual variance (sigma^2)
+  const predicted = data.map(d => emaxModel(d.x, E0, Emax, ED50));
+  const residuals = data.map((d, i) => d.y - predicted[i]);
+  const rss = residuals.reduce((sum, r) => sum + r * r, 0);
+  const sigma2 = rss / (data.length - 2); // 2 parameters (Emax, ED50)
+  
+  // Compute Hessian matrix (2x2) using finite differences
+  const delta = 0.001;
+  
+  // Second derivatives
+  const d2RSS_dEmax2 = (
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax + delta, ED50))) +
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax - delta, ED50))) -
+    2 * rss
+  ) / (delta * delta);
+  
+  const d2RSS_dED502 = (
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax, ED50 + delta))) +
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax, ED50 - delta))) -
+    2 * rss
+  ) / (delta * delta);
+  
+  const d2RSS_dEmaxdED50 = (
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax + delta, ED50 + delta))) -
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax + delta, ED50 - delta))) -
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax - delta, ED50 + delta))) +
+    calculateRSS(data, data.map(d => emaxModel(d.x, E0, Emax - delta, ED50 - delta)))
+  ) / (4 * delta * delta);
+  
+  // Hessian matrix H = [[H11, H12], [H21, H22]]
+  const H11 = d2RSS_dEmax2 / 2;
+  const H22 = d2RSS_dED502 / 2;
+  const H12 = d2RSS_dEmaxdED50 / 2;
+  
+  // Invert 2x2 Hessian: inv(H) = 1/det * [[H22, -H12], [-H12, H11]]
+  const det = H11 * H22 - H12 * H12;
+  
+  if (det <= 0) {
+    // Fallback if Hessian is singular or not positive definite
+    console.warn('Hessian not positive definite, using approximate covariance');
+    return {
+      standardErrors: {
+        Emax: Math.sqrt(Math.abs(sigma2 / H11)) || 1,
+        ED50: Math.sqrt(Math.abs(sigma2 / H22)) || 0.1
+      },
+      covMatrix: {
+        var_Emax: Math.abs(sigma2 / H11),
+        var_ED50: Math.abs(sigma2 / H22),
+        cov_Emax_ED50: 0
+      }
+    };
   }
-
-  // Calculate standard deviation of estimates
-  const calcSD = (arr) => {
-    const mean = arr.reduce((a, b) => a + b) / arr.length;
-    const variance = arr.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / arr.length;
-    return Math.sqrt(variance);
-  };
-
+  
+  // Variance-covariance matrix = sigma^2 * inv(H)
+  const var_Emax = sigma2 * H22 / det;
+  const var_ED50 = sigma2 * H11 / det;
+  const cov_Emax_ED50 = -sigma2 * H12 / det;
+  
   return {
-    Emax: calcSD(estimates.Emax),
-    ED50: calcSD(estimates.ED50)
+    standardErrors: {
+      Emax: Math.sqrt(Math.abs(var_Emax)),
+      ED50: Math.sqrt(Math.abs(var_ED50))
+    },
+    covMatrix: {
+      var_Emax,
+      var_ED50,
+      cov_Emax_ED50
+    }
   };
+}
+
+// Generate samples from bivariate normal distribution using Cholesky decomposition
+// This properly accounts for correlation between Emax and ED50
+function sampleMultivariateNormal(mean, covMatrix, numSamples = 100) {
+  const { var_Emax, var_ED50, cov_Emax_ED50 } = covMatrix;
+  
+  // Cholesky decomposition of covariance matrix
+  // For 2x2: L = [[L11, 0], [L21, L22]]
+  const L11 = Math.sqrt(var_Emax);
+  const L21 = cov_Emax_ED50 / L11;
+  const L22 = Math.sqrt(var_ED50 - L21 * L21);
+  
+  if (isNaN(L22) || L22 <= 0) {
+    console.warn('Covariance matrix not positive definite');
+    return [];
+  }
+  
+  const samples = [];
+  for (let i = 0; i < numSamples; i++) {
+    // Generate two independent standard normal random variables (Box-Muller transform)
+    const u1 = Math.random();
+    const u2 = Math.random();
+    const z1 = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    const z2 = Math.sqrt(-2 * Math.log(u1)) * Math.sin(2 * Math.PI * u2);
+    
+    // Transform to correlated samples using Cholesky
+    const Emax_sample = mean.Emax + L11 * z1;
+    const ED50_sample = mean.ED50 + L21 * z1 + L22 * z2;
+    
+    samples.push({ Emax: Emax_sample, ED50: ED50_sample });
+  }
+  
+  return samples;
 }
 
 function fmt(x, digits = 2) {
@@ -144,9 +234,10 @@ export default function App() {
   // Simulated experimental data
   const [experimentData, setExperimentData] = useState([]);
   
-  // Optimized parameters and their standard errors
+  // Optimized parameters, their standard errors, and covariance matrix
   const [optimizedParams, setOptimizedParams] = useState(null);
   const [standardErrors, setStandardErrors] = useState(null);
+  const [covMatrix, setCovMatrix] = useState(null);
   const [isOptimizing, setIsOptimizing] = useState(false);
 
   const updateParam = (key, value) => {
@@ -180,6 +271,7 @@ export default function App() {
     setExperimentData(data);
     setOptimizedParams(null);
     setStandardErrors(null);
+    setCovMatrix(null);
   };
 
   // Optimize parameters
@@ -194,24 +286,59 @@ export default function App() {
     // Use setTimeout to allow UI to update
     setTimeout(() => {
       const optimized = optimizeParameters(experimentData, params, 2000, 0.05);
-      const se = calculateStandardErrors(experimentData, optimized, 50);
+      const result = calculateCovarianceMatrix(experimentData, optimized);
       
       setOptimizedParams(optimized);
-      setStandardErrors(se);
+      setStandardErrors(result.standardErrors);
+      setCovMatrix(result.covMatrix);
       setParams(optimized); // Update sliders to optimized values
       setIsOptimizing(false);
     }, 100);
   };
 
-  // Generate smooth curve for current parameters
+  // Generate smooth curve for current parameters (dense for smooth hovering)
   const curve = useMemo(() => {
     const maxDose = Math.max(...doses, 5);
-    const points = Array.from({ length: 200 }, (_, i) => (i / 199) * maxDose);
+    const points = Array.from({ length: 201 }, (_, i) => (i / 200) * maxDose);
     return points.map(x => ({
       x,
       y: Math.max(0, Math.min(120, emaxModel(x, E0, params.Emax, params.ED50)))
     }));
   }, [params, doses]);
+
+  // Generate confidence bands using multivariate sampling
+  const confidenceBands = useMemo(() => {
+    if (!optimizedParams || !covMatrix) return null;
+    
+    const maxDose = Math.max(...doses, 5);
+    const points = Array.from({ length: 201 }, (_, i) => (i / 200) * maxDose);
+    
+    // Sample from multivariate normal distribution
+    const samples = sampleMultivariateNormal(optimizedParams, covMatrix, 200);
+    
+    if (samples.length === 0) return null;
+    
+    return points.map(x => {
+      const yFit = emaxModel(x, E0, optimizedParams.Emax, optimizedParams.ED50);
+      
+      // Calculate predictions for all parameter samples at this dose
+      const predictions = samples.map(sample => 
+        emaxModel(x, E0, sample.Emax, sample.ED50)
+      );
+      
+      // Calculate percentiles (use 5th and 95th for 90% CI)
+      predictions.sort((a, b) => a - b);
+      const lowerIdx = Math.floor(predictions.length * 0.05);
+      const upperIdx = Math.floor(predictions.length * 0.95);
+      
+      return {
+        x,
+        y: yFit,
+        upper: Math.max(0, Math.min(120, predictions[upperIdx])),
+        lower: Math.max(0, Math.min(120, predictions[lowerIdx]))
+      };
+    });
+  }, [optimizedParams, covMatrix, doses]);
 
   // Calculate RSS if we have experiment data
   const rss = useMemo(() => {
@@ -265,7 +392,7 @@ export default function App() {
 
               <div className="space-y-4">
                 <SliderRow
-                  label="Max Effect Emax"
+                  label="Emax"
                   min={0}
                   max={100}
                   step={0.5}
@@ -317,9 +444,17 @@ export default function App() {
                         <span>ED50:</span>
                         <span className="font-mono">{fmt(optimizedParams.ED50)} ± {fmt(standardErrors.ED50)}</span>
                       </div>
+                      {covMatrix && (
+                        <div className="flex justify-between text-xs pt-2 border-t border-gray-200 mt-2">
+                          <span>Correlation:</span>
+                          <span className="font-mono">
+                            {fmt(covMatrix.cov_Emax_ED50 / Math.sqrt(covMatrix.var_Emax * covMatrix.var_ED50), 3)}
+                          </span>
+                        </div>
+                      )}
                     </div>
                     <p className="text-xs text-gray-500 mt-2">
-                      Values shown as estimate ± standard error
+                      Confidence band uses multivariate uncertainty (accounts for parameter correlation)
                     </p>
                   </div>
                 )}
@@ -343,12 +478,72 @@ export default function App() {
                     domain={[0, 120]}
                     label={{ value: 'Response', angle: -90, position: 'insideLeft' }}
                   />
-                  <Tooltip formatter={(val) => fmt(val)} />
+                  <Tooltip 
+                    content={({ active, payload }) => {
+                      if (!active || !payload || payload.length === 0) return null;
+                      
+                      // Filter out "Observed Data" from payload
+                      const filteredPayload = payload.filter(p => p.name !== "Observed Data");
+                      if (filteredPayload.length === 0) return null;
+                      
+                      // Get the dose (x value) from the first payload entry
+                      const dose = payload[0]?.payload?.x;
+                      
+                      // Find model fit and confidence limits
+                      const modelFit = filteredPayload.find(p => p.name === "Model Fit");
+                      const upper = payload[0]?.payload?.upper;
+                      const lower = payload[0]?.payload?.lower;
+                      
+                      return (
+                        <div className="bg-white border border-gray-300 rounded p-2 shadow-lg">
+                          <div className="text-sm font-semibold mb-1">
+                            Dose: {fmt(dose)} mg/kg
+                          </div>
+                          {modelFit && (
+                            <div className="text-sm">
+                              <span style={{ color: modelFit.color }}>Prediction: </span>
+                              <span className="font-semibold">{fmt(modelFit.value)}</span>
+                            </div>
+                          )}
+                          {upper !== undefined && lower !== undefined && (
+                            <div className="text-sm text-gray-600">
+                              90% CI: [{fmt(lower)}, {fmt(upper)}]
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }}
+                  />
                   <Legend verticalAlign="top" height={36} />
                   
-                  {/* Model curve */}
+                  {/* Confidence band (90% CI) */}
+                  {confidenceBands && (
+                    <Area
+                      name="90% CI"
+                      data={confidenceBands}
+                      dataKey="upper"
+                      fill="#8884d8"
+                      fillOpacity={0.2}
+                      stroke="none"
+                      isAnimationActive={false}
+                      legendType="rect"
+                    />
+                  )}
+                  {confidenceBands && (
+                    <Area
+                      data={confidenceBands}
+                      dataKey="lower"
+                      fill="#ffffff"
+                      fillOpacity={1}
+                      stroke="none"
+                      isAnimationActive={false}
+                    />
+                  )}
+                  
+                  {/* Model curve - uses its own data for smooth hovering */}
                   <Line
                     name="Model Fit"
+                    data={confidenceBands || curve}
                     type="monotone"
                     dataKey="y"
                     stroke="#8884d8"
@@ -357,7 +552,7 @@ export default function App() {
                     isAnimationActive={false}
                   />
                   
-                  {/* Experimental data points */}
+                  {/* Experimental data points - visible but filtered from tooltip */}
                   {experimentData.length > 0 && (
                     <Scatter
                       name="Observed Data"
